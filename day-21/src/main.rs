@@ -7,7 +7,6 @@ use std::{
 
 fn main() -> Result<(), Box<dyn Error>> {
     let door_codes: Vec<Vec<char>> = fs::read_to_string("day-21/day21_input.txt")?
-        //let door_codes: Vec<Vec<char>> = fs::read_to_string("day-21/test.txt")?
         .trim()
         .split('\n')
         .map(|code| code.trim().chars().collect())
