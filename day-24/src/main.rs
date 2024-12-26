@@ -10,31 +10,188 @@ fn main() -> Result<(), Box<dyn Error>> {
     scanner.scan_device_config();
 
     parse_config(&scanner.tokens, &mut wires, &mut logic_gates);
+    let input_nums_bit_len = wires.len() / 2;
 
+    // Get output for existing circuit.
     run_device(&mut wires, &logic_gates);
+    let z_wire_output = get_value_across_wire('z', &wires);
+    println!("z wire output with current config: {z_wire_output}");
 
-    let mut z_wires = vec![];
-    for wire in wires.keys() {
-        if wire.starts_with('z') {
-            z_wires.push(*wire);
-        }
-    }
-    z_wires.sort();
-    let mut z_wire_output: usize = 0;
-    for wire in z_wires.into_iter().rev() {
-        match wires.get(wire).unwrap() {
-            true => {
-                z_wire_output = (z_wire_output << 1) ^ 1;
-            }
-            false => {
-                z_wire_output = z_wire_output << 1;
-            }
-        }
-    }
-
-    println!("z wire output: {z_wire_output}");
+    // Find which wires to swap to fix ripple carry adder circuit.
+    let mut swapped_wires = repair_ripple_carry_adder(input_nums_bit_len, &mut logic_gates);
+    swapped_wires.sort();
+    println!("{}", swapped_wires.join(","));
 
     Ok(())
+}
+
+fn repair_ripple_carry_adder<'source, 'gates>(
+    input_bit_len: usize,
+    logic_gates: &'gates mut Vec<LogicGate<'source>>,
+) -> Vec<&'source str> {
+    let mut swapped_wires = vec![];
+
+    let mut input_carry_wire = "";
+    for bit_num in 0..input_bit_len {
+        let mut bit_num_str = bit_num.to_string();
+        if bit_num <= 9 {
+            bit_num_str = format!("0{bit_num_str}");
+        }
+        let x_input_wire = format!("x{bit_num_str}");
+        let z_output_wire = format!("z{bit_num_str}");
+
+        // Get idx of of all logic gates involved in nth bit.
+        let mut x_y_xor_gate_idx = logic_gates.len();
+        let mut x_y_and_gate_idx = logic_gates.len();
+        let mut carry_in_xor_gate_idx = logic_gates.len();
+        let mut carry_in_and_gate_idx = logic_gates.len();
+        for idx in 0..logic_gates.len() {
+            let gate = &logic_gates[idx];
+            // Check for XOR gate
+            match gate.operator {
+                TokenType::Xor => {
+                    if gate.left == x_input_wire || gate.right == x_input_wire {
+                        x_y_xor_gate_idx = idx;
+                    } else if gate.left == input_carry_wire || gate.right == input_carry_wire {
+                        carry_in_xor_gate_idx = idx;
+                    }
+                }
+                TokenType::And => {
+                    if gate.left == x_input_wire || gate.right == x_input_wire {
+                        x_y_and_gate_idx = idx;
+                    } else if gate.left == input_carry_wire || gate.right == input_carry_wire {
+                        carry_in_and_gate_idx = idx;
+                    }
+                }
+                _ => (),
+            }
+        }
+        if bit_num == 0 {
+            // Swap if input XOR gate doesn't output to first z00 bit.
+            if logic_gates[x_y_xor_gate_idx].output != z_output_wire {
+                swap_outputs(
+                    x_y_xor_gate_idx,
+                    x_y_and_gate_idx,
+                    logic_gates,
+                    &mut swapped_wires,
+                );
+            }
+            input_carry_wire = logic_gates[x_y_and_gate_idx].output;
+        } else {
+            let mut carry_out_guess_from_carry_in = logic_gates.len();
+            let mut carry_out_guess_from_x_y = logic_gates.len();
+            let carry_out_input_from_carry_in = logic_gates[carry_in_and_gate_idx].output;
+            let carry_out_input_from_x_y = logic_gates[x_y_and_gate_idx].output;
+            for idx in 0..logic_gates.len() {
+                let gate = &logic_gates[idx];
+                if gate.operator == TokenType::Or {
+                    if gate.left == carry_out_input_from_carry_in
+                        || gate.right == carry_out_input_from_carry_in
+                    {
+                        carry_out_guess_from_carry_in = idx;
+                    }
+                    if gate.left == carry_out_input_from_x_y
+                        || gate.right == carry_out_input_from_x_y
+                    {
+                        carry_out_guess_from_x_y = idx;
+                    }
+                }
+            }
+            // Verify carry_in_xor_gate output (output z wire).
+            if logic_gates[carry_in_xor_gate_idx].output != z_output_wire {
+                let mut swap_idx = logic_gates.len();
+                if logic_gates[x_y_xor_gate_idx].output == z_output_wire {
+                    swap_idx = x_y_xor_gate_idx;
+                } else if logic_gates[x_y_and_gate_idx].output == z_output_wire {
+                    swap_idx = x_y_and_gate_idx;
+                    carry_out_guess_from_x_y = carry_out_guess_from_carry_in;
+                } else if logic_gates[carry_in_and_gate_idx].output == z_output_wire {
+                    swap_idx = carry_in_and_gate_idx;
+                    carry_out_guess_from_carry_in = carry_out_guess_from_x_y;
+                } else if carry_out_guess_from_carry_in < logic_gates.len()
+                    && logic_gates[carry_out_guess_from_carry_in].output == z_output_wire
+                {
+                    swap_idx = carry_out_guess_from_carry_in;
+                } else if carry_out_guess_from_x_y < logic_gates.len()
+                    && logic_gates[carry_out_guess_from_x_y].output == z_output_wire
+                {
+                    swap_idx = carry_out_guess_from_x_y;
+                }
+                swap_outputs(
+                    carry_in_xor_gate_idx,
+                    swap_idx,
+                    logic_gates,
+                    &mut swapped_wires,
+                );
+            }
+            // Verify x_y_xor_gate output.
+            let mut expected_x_y_xor_output = logic_gates[carry_in_xor_gate_idx].left;
+            if expected_x_y_xor_output == input_carry_wire {
+                expected_x_y_xor_output = logic_gates[carry_in_xor_gate_idx].right;
+            }
+            if logic_gates[x_y_xor_gate_idx].output != expected_x_y_xor_output {
+                let mut swap_idx = logic_gates.len();
+                if logic_gates[x_y_and_gate_idx].output == expected_x_y_xor_output {
+                    swap_idx = x_y_and_gate_idx;
+                } else if logic_gates[carry_in_and_gate_idx].output == expected_x_y_xor_output {
+                    swap_idx = carry_in_and_gate_idx;
+                    carry_out_guess_from_carry_in = carry_out_guess_from_x_y;
+                } else if carry_out_guess_from_carry_in < logic_gates.len()
+                    && logic_gates[carry_out_guess_from_carry_in].output == expected_x_y_xor_output
+                {
+                    swap_idx = carry_out_guess_from_carry_in;
+                } else if carry_out_guess_from_x_y < logic_gates.len()
+                    && logic_gates[carry_out_guess_from_x_y].output == expected_x_y_xor_output
+                {
+                    swap_idx = carry_out_guess_from_x_y;
+                }
+                swap_outputs(x_y_xor_gate_idx, swap_idx, logic_gates, &mut swapped_wires);
+            }
+
+            input_carry_wire = logic_gates[carry_out_guess_from_carry_in].output;
+        }
+    }
+
+    swapped_wires
+}
+
+fn swap_outputs<'source>(
+    gate_1_idx: usize,
+    gate_2_idx: usize,
+    logic_gates: &mut Vec<LogicGate<'source>>,
+    swapped_wires: &mut Vec<&'source str>,
+) {
+    let tmp = logic_gates[gate_1_idx].output;
+    logic_gates[gate_1_idx].output = logic_gates[gate_2_idx].output;
+    logic_gates[gate_2_idx].output = tmp;
+    swapped_wires.push(logic_gates[gate_2_idx].output);
+    swapped_wires.push(logic_gates[gate_1_idx].output);
+}
+
+fn get_value_across_wire<'source, 'state>(
+    target_wire: char,
+    wires: &'state HashMap<&'source str, bool>,
+) -> usize {
+    let mut target_wires = vec![];
+    for wire in wires.keys() {
+        if wire.starts_with(target_wire) {
+            target_wires.push(*wire);
+        }
+    }
+    target_wires.sort();
+    let mut target_wire_value = 0;
+    for wire in target_wires.into_iter().rev() {
+        match wires.get(wire).unwrap() {
+            true => {
+                target_wire_value = (target_wire_value << 1) ^ 1;
+            }
+            false => {
+                target_wire_value = target_wire_value << 1;
+            }
+        }
+    }
+
+    target_wire_value
 }
 
 fn run_device<'source, 'state>(
